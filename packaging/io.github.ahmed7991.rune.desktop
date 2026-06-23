@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=rune
+GenericName=Claude Code Sessions
+Comment=A native control cockpit for your Claude Code sessions
+Exec=rune
+Icon=io.github.ahmed7991.rune
+Terminal=false
+Categories=Development;
+Keywords=claude;terminal;agent;ai;
+StartupNotify=true
+StartupWMClass=rune

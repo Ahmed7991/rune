@@ -1,0 +1,30 @@
+[package]
+name = "rune"
+version = "0.1.1"
+edition = "2021"
+description = "A native (GTK4 + VTE, no webview) Linux control cockpit for Claude Code sessions."
+license = "MIT"
+repository = "https://github.com/Ahmed7991/rune"
+default-run = "rune"
+
+[workspace]
+# The input-validation spike (spike/vte-probe) is a standalone reference crate,
+# kept for the record — it is NOT part of the app build.
+exclude = ["spike"]
+
+[dependencies]
+# Pinned for Ubuntu 24.04's GTK 4.14 — do NOT bump to gtk4 0.11 / vte4 0.10
+# (those need a newer system GTK). Matches the validated spike.
+gtk4 = { version = "0.9", features = ["v4_10"] }
+vte4 = "0.8"
+serde = { version = "1", features = ["derive"] }
+# preserve_order: the hooks installer edits the user's ~/.claude/settings.json
+# in place; keeping JSON object key order means the merge only adds rune's keys
+# instead of alphabetically rewriting the whole file (a noisy, disrespectful diff).
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"

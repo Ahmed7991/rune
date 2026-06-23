@@ -1,0 +1,18 @@
+# Rust build artifacts
+target/
+**/target/
+
+# Editor / OS junk
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# Local Claude Code session state (not part of the product)
+/.claude/settings.local.json
+/.remember/
+
+# packaging output (attach to releases, not git)
+/dist/
+/target/deb/

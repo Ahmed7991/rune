@@ -1,0 +1,28 @@
+<!-- rune app icon: the Raidō rune (ᚱ) carved into stone + a cursor block, lit in
+     Mission-Control cyan. Bespoke mark; drives the app icon AND the header mark. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="stone" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0" stop-color="#161d27"/><stop offset="0.55" stop-color="#0c121b"/><stop offset="1" stop-color="#060a0f"/></linearGradient>
+    <filter id="grain"><feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="2" result="n"/>
+      <feColorMatrix in="n" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 0.05 0"/>
+      <feComposite operator="over" in2="SourceGraphic"/></filter>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="0" result="b2"/><feGaussianBlur stdDeviation="6" result="b1"/>
+      <feMerge><feMergeNode in="b2"/><feMergeNode in="b1"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  </defs>
+  <rect x="6" y="6" width="244" height="244" rx="56" fill="url(#stone)"/>
+  <rect x="6" y="6" width="244" height="244" rx="56" fill="#000" filter="url(#grain)" opacity="0.6"/>
+  <rect x="7.5" y="7.5" width="241" height="241" rx="54.5" fill="none" stroke="#222c38" stroke-width="1.5"/>
+  <g fill="none" stroke-linejoin="miter" stroke-linecap="square">
+    <g transform="translate(0,3)" stroke="#2b3a4b" stroke-width="26" opacity="0.8">
+      <path d="M92 56 L92 200"/><path d="M92 56 L150 72 L154 104 L92 118"/><path d="M92 118 L158 200"/></g>
+    <g stroke="#04070b" stroke-width="26">
+      <path d="M92 56 L92 200"/><path d="M92 56 L150 72 L154 104 L92 118"/><path d="M92 118 L158 200"/></g>
+    <g stroke="#36d3fa" stroke-width="9" filter="url(#glow)">
+      <path d="M92 56 L92 200"/><path d="M92 56 L150 72 L154 104 L92 118"/><path d="M92 118 L158 200"/></g>
+    <g stroke="#cdefff" stroke-width="3">
+      <path d="M92 56 L92 200"/><path d="M92 56 L150 72 L154 104 L92 118"/><path d="M92 118 L158 200"/></g>
+  </g>
+  <rect x="172" y="176" width="34" height="22" rx="3" fill="#36d3fa" filter="url(#glow)"/>
+</svg>
