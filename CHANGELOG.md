@@ -2,6 +2,18 @@
 
 All notable changes to **rune**. Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.2] — 2026-06-29
+
+### Added
+- **The project rail now auto-discovers your projects.** Above the projects you've
+  pinned, the rail shows every project with recent on-disk Claude history (active
+  in the last 14 days) under a **Recent** section — so a project you worked in but
+  never added is still one click away (handy after a crash, when you don't remember
+  which sessions were open). Right-click a discovered project to **pin** it.
+- **Click a project to open its sessions.** Selecting a project now opens its full
+  session history in the main pane — newest first, each one resumable, plus a
+  one-click **New session**. Works for pinned and discovered projects alike.
+
 ## [0.1.1] — 2026-06-23
 
 Security hardening, from a multi-agent adversarial review (no critical or high
@@ -36,4 +48,6 @@ First public release — a native (GTK4 + VTE, no webview) Linux cockpit for Cla
 - **Reply from the dashboard** — feed a message to a hosted session without switching to it.
 - **Settings** (font, theme, GPU renderer), tab/project **persistence**, a `.deb` package, and a bespoke app icon.
 
+[0.1.2]: https://github.com/Ahmed7991/rune/releases/tag/v0.1.2
+[0.1.1]: https://github.com/Ahmed7991/rune/releases/tag/v0.1.1
 [0.1.0]: https://github.com/Ahmed7991/rune/releases/tag/v0.1.0

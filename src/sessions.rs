@@ -5,6 +5,7 @@
 //! prompt, else a short id), last-active time (file mtime), and a prompt count.
 
 use std::collections::HashSet;
+use std::io::BufRead;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -83,6 +84,69 @@ pub fn recent_sessions(projects: &[String], limit: usize) -> Vec<(String, Sessio
 /// directory scan, no file parsing. Powers the dashboard project cards.
 pub fn session_count(project_path: &str) -> usize {
     candidate_files(&claude::project_transcript_dir(project_path)).len()
+}
+
+/// A project discovered from `~/.claude/projects/` rather than the hand-curated
+/// rail list. `path` is the *real* working directory, recovered from a
+/// transcript's `cwd` field — the encoded directory name itself is lossy
+/// (`/`, `_`, `.`, `-` all collapse to `-`) so it can't be reversed. `latest` is
+/// the project's most-recent session mtime, for "recently active" ordering.
+pub struct DiscoveredProject {
+    pub path: String,
+    pub latest: SystemTime,
+}
+
+/// Every project with on-disk Claude history, newest-active first. For each
+/// project dir we recover the real cwd from its newest transcript and keep it
+/// only if that directory still exists — so deleted/renamed/junk paths drop out.
+/// Cheap-ish: one directory scan plus a short bounded head-read per project.
+pub fn discover_projects() -> Vec<DiscoveredProject> {
+    let Ok(read_dir) = std::fs::read_dir(claude::projects_root()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in read_dir.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let mut files = candidate_files(&dir);
+        if files.is_empty() {
+            continue;
+        }
+        files.sort_by(|a, b| b.1.cmp(&a.1)); // newest first
+        let latest = files[0].1;
+        // Recover the real cwd from the newest transcript that carries one.
+        let Some(path) = files.iter().find_map(|(p, _, _)| recover_cwd(p)) else {
+            continue;
+        };
+        if !Path::new(&path).is_dir() {
+            continue;
+        }
+        out.push(DiscoveredProject { path, latest });
+    }
+    out.sort_by(|a, b| b.latest.cmp(&a.latest));
+    out
+}
+
+/// Pull the real working directory out of a transcript's `cwd` field. Reads
+/// line-by-line and stops at the first record that has one (it's on every
+/// user/assistant turn, so near the top), bounded so a pathological file can't
+/// stall the scan.
+fn recover_cwd(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines().take(400).map_while(Result::ok) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
+            if !cwd.is_empty() {
+                return Some(cwd.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// A project's estimated total cost: the sum of every transcript's cost. This
@@ -375,5 +439,51 @@ pub fn relative_time(t: SystemTime) -> String {
         3600..=86_399 => format!("{}h ago", secs / 3600),
         86_400..=2_591_999 => format!("{}d ago", secs / 86_400),
         _ => format!("{}mo ago", secs / 2_592_000),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// The whole point of `recover_cwd`: get the *real* path back even though the
+    /// encoded directory name is lossy. The first transcript line is often a
+    /// summary record with no `cwd` (as seen on disk), so recovery must scan past
+    /// it — and must preserve characters the dir-name encoding destroys, like the
+    /// underscore in `side_projects`.
+    #[test]
+    fn recover_cwd_skips_a_cwd_less_first_line_and_keeps_underscores() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("rune-test-{}.jsonl", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            // Line 1: a real-world leaf/summary record — no cwd.
+            writeln!(f, r#"{{"type":"summary","leafUuid":"x","sessionId":"y"}}"#).unwrap();
+            // Line 2: a user turn carrying the true working directory.
+            writeln!(
+                f,
+                r#"{{"type":"user","cwd":"/home/x/Documents/side_projects/sample_app"}}"#
+            )
+            .unwrap();
+        }
+        let got = recover_cwd(&path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            got.as_deref(),
+            Some("/home/x/Documents/side_projects/sample_app")
+        );
+    }
+
+    /// A transcript with no `cwd` anywhere yields `None` (so discovery drops it)
+    /// rather than guessing from the lossy directory name.
+    #[test]
+    fn recover_cwd_is_none_when_no_record_carries_one() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("rune-test-nocwd-{}.jsonl", std::process::id()));
+        std::fs::write(&path, "{\"type\":\"summary\"}\n{\"type\":\"x\"}\n").unwrap();
+        let got = recover_cwd(&path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(got, None);
     }
 }

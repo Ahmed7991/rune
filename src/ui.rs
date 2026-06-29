@@ -47,11 +47,22 @@ struct AppState {
     tabs: Vec<TabInfo>,
     selected_project: Option<String>,
     notebook: Notebook,
-    /// Right-pane stack: "home" (the dashboard) ↔ "sessions" (the terminals).
+    /// Right-pane stack: "home" (the dashboard) ↔ "sessions" (the terminals) ↔
+    /// "project" (one project's session list).
     stack: Stack,
     /// The dashboard's scrollable content box — cleared + rebuilt on show.
     dash_box: gtk4::Box,
+    /// The per-project session-list content box — cleared + rebuilt when a rail
+    /// project is opened (the "project" stack page).
+    proj_box: gtk4::Box,
+    /// The project currently shown on the "project" page, so the status poll can
+    /// keep its session list live while it's the visible page.
+    project_view: Option<String>,
     sidebar: ListBox,
+    /// Maps each sidebar row (by its `ListBox` index, headers included) to the
+    /// project path it selects, or `None` for a non-selectable section header.
+    /// Rebuilt with the rail so selection survives the pinned/recent split.
+    sidebar_rows: Rc<RefCell<Vec<Option<String>>>>,
     new_session_btn: Button,
     resume_btn: Button,
     /// The "needs-you" queue button + its count badge, refreshed on the status
@@ -251,11 +262,24 @@ pub fn build_ui(app: &Application) {
         .vexpand(true)
         .build();
 
+    // The per-project session-list page — same dark surface as the dashboard.
+    let proj_box = gtk4::Box::new(Orientation::Vertical, 16);
+    proj_box.add_css_class("rune-dash");
+    proj_box.set_hexpand(true);
+    proj_box.set_vexpand(true);
+    let proj_scroll = ScrolledWindow::builder()
+        .child(&proj_box)
+        .hscrollbar_policy(PolicyType::Never)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+
     let stack = Stack::new();
     stack.set_hexpand(true);
     stack.set_vexpand(true);
     stack.add_named(&dash_scroll, Some("home"));
     stack.add_named(&notebook, Some("sessions"));
+    stack.add_named(&proj_scroll, Some("project"));
 
     let paned = Paned::new(Orientation::Horizontal);
     paned.set_start_child(Some(&sidebar_box));
@@ -281,7 +305,10 @@ pub fn build_ui(app: &Application) {
         notebook: notebook.clone(),
         stack: stack.clone(),
         dash_box: dash_box.clone(),
+        proj_box: proj_box.clone(),
+        project_view: None,
         sidebar: sidebar.clone(),
+        sidebar_rows: Rc::new(RefCell::new(Vec::new())),
         new_session_btn: new_session_btn.clone(),
         resume_btn: resume_btn.clone(),
         queue_btn: queue_btn.clone(),
@@ -307,13 +334,23 @@ pub fn build_ui(app: &Application) {
         let st = state.clone();
         sidebar.connect_row_selected(move |_, row| {
             if let Some(row) = row {
-                let idx = row.index();
-                let mut s = st.borrow_mut();
-                if let Some(path) = s.config.projects.get(idx as usize).cloned() {
+                if let Some(path) = row_project(&st, row.index()) {
+                    let mut s = st.borrow_mut();
                     s.selected_project = Some(path);
                     s.new_session_btn.set_sensitive(true);
                     s.resume_btn.set_sensitive(true);
                 }
+            }
+        });
+    }
+    {
+        // Clicking (or Enter on) a rail row opens that project's session list in
+        // the main pane. Only fires on user activation, never on the programmatic
+        // `select_row` inside `rebuild_sidebar` — so opening a project can't loop.
+        let st = state.clone();
+        sidebar.connect_row_activated(move |_, row| {
+            if let Some(path) = row_project(&st, row.index()) {
+                show_project(&st, &path);
             }
         });
     }
@@ -471,32 +508,85 @@ pub fn build_ui(app: &Application) {
 // Sidebar
 // ───────────────────────────────────────────────────────────────────────────
 
+/// How recently a discovered project must have been active to surface in the
+/// rail's auto "RECENT" section, and how many such rows we show at most. Keeps
+/// the auto-section to what you're actually working on rather than every folder
+/// Claude has ever touched.
+const RECENT_RAIL_WINDOW: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 3600);
+const RECENT_RAIL_MAX: usize = 8;
+
 fn rebuild_sidebar(state: &State) {
-    let (sidebar, projects, selected, rail_badges) = {
+    let (sidebar, projects, selected, rail_badges, sidebar_rows) = {
         let s = state.borrow();
         (
             s.sidebar.clone(),
             s.config.projects.clone(),
             s.selected_project.clone(),
             s.rail_badges.clone(),
+            s.sidebar_rows.clone(),
         )
     };
 
     while let Some(child) = sidebar.first_child() {
         sidebar.remove(&child);
     }
-    // The rows (and their badge labels) are about to be recreated — drop the
-    // stale handles so the poll only ever paints badges that are on screen.
+    // The rows (and their badge labels + path map) are about to be recreated —
+    // drop the stale handles so the poll only paints badges that are on screen
+    // and selection maps to the right project.
     rail_badges.borrow_mut().clear();
 
-    let mut row_to_select: Option<ListBoxRow> = None;
+    // Auto-discovered projects (recently active, not already pinned) — the
+    // "RECENT" section. So a battery-died crash doesn't lose track of which
+    // projects had work in flight, every recent project is reachable from the
+    // rail even if it was never manually added.
+    let pinned: HashSet<String> = projects
+        .iter()
+        .map(|p| config::normalize_project_path(p))
+        .collect();
+    let now = std::time::SystemTime::now();
+    let home = glib::home_dir().to_string_lossy().into_owned();
+    let recent: Vec<String> = sessions::discover_projects()
+        .into_iter()
+        .filter(|d| !pinned.contains(&config::normalize_project_path(&d.path)))
+        // Drop the obvious non-projects: $HOME itself and anything under /tmp.
+        // These get a Claude transcript when you run it ad-hoc, but they aren't
+        // projects you'd want cluttering the rail.
+        .filter(|d| d.path != home && !d.path.starts_with("/tmp"))
+        .filter(|d| now.duration_since(d.latest).map(|age| age <= RECENT_RAIL_WINDOW).unwrap_or(false))
+        .take(RECENT_RAIL_MAX)
+        .map(|d| d.path)
+        .collect();
+
+    // Build the rows first (each carries the project it selects, or `None` for a
+    // section header), then append them and rebuild the row→path map together.
+    let mut entries: Vec<(ListBoxRow, Option<String>)> = Vec::new();
+    // Only label the sections when both exist — a user with no auto-recents
+    // still just sees their projects, unheadered, exactly as before.
+    if !recent.is_empty() && !projects.is_empty() {
+        entries.push((make_rail_subhead("PINNED"), None));
+    }
     for path in &projects {
-        let row = make_project_row(state, path);
-        sidebar.append(&row);
-        if selected.as_deref() == Some(path.as_str()) {
-            row_to_select = Some(row);
+        entries.push((make_project_row(state, path, true), Some(path.clone())));
+    }
+    if !recent.is_empty() {
+        entries.push((make_rail_subhead("RECENT"), None));
+        for path in &recent {
+            entries.push((make_project_row(state, path, false), Some(path.clone())));
         }
     }
+
+    let mut row_to_select: Option<ListBoxRow> = None;
+    let mut rows = sidebar_rows.borrow_mut();
+    rows.clear();
+    for (row, path) in &entries {
+        sidebar.append(row);
+        if path.is_some() && path.as_deref() == selected.as_deref() {
+            row_to_select = Some(row.clone());
+        }
+        rows.push(path.clone());
+    }
+    drop(rows);
+
     if let Some(row) = row_to_select {
         sidebar.select_row(Some(&row));
     }
@@ -514,9 +604,42 @@ fn rebuild_sidebar(state: &State) {
     s.resume_btn.set_sensitive(selected.is_some());
 }
 
-fn make_project_row(state: &State, path: &str) -> ListBoxRow {
+/// The project a sidebar row selects, or `None` for a section header (or a stale
+/// index). Looks the path up in the rebuilt row→path map.
+fn row_project(state: &State, idx: i32) -> Option<String> {
+    if idx < 0 {
+        return None;
+    }
+    state
+        .borrow()
+        .sidebar_rows
+        .borrow()
+        .get(idx as usize)
+        .cloned()
+        .flatten()
+}
+
+/// A small dim section divider inside the rail ("PINNED" / "RECENT"). A
+/// non-selectable, non-activatable row so it never steals the selection.
+fn make_rail_subhead(text: &str) -> ListBoxRow {
+    let row = ListBoxRow::new();
+    row.set_selectable(false);
+    row.set_activatable(false);
+    let label = Label::builder().label(text).xalign(0.0).build();
+    label.add_css_class("rail-subhead");
+    row.set_child(Some(&label));
+    row
+}
+
+/// A rail row for `path`. `pinned` rows come from the curated list (reorder /
+/// remove menu); unpinned rows are auto-discovered "RECENT" projects (a "Pin to
+/// rail" menu) and are dimmed so the two sections read distinctly.
+fn make_project_row(state: &State, path: &str, pinned: bool) -> ListBoxRow {
     let row = ListBoxRow::new();
     row.add_css_class("proj-row");
+    if !pinned {
+        row.add_css_class("proj-row-auto");
+    }
     let hbox = gtk4::Box::new(Orientation::Horizontal, 9);
     hbox.set_margin_start(9);
     hbox.set_margin_end(9);
@@ -526,15 +649,18 @@ fn make_project_row(state: &State, path: &str) -> ListBoxRow {
     // The project's identity swatch — the same colour used for it everywhere.
     hbox.append(&make_swatch(path, 8));
 
+    let hint = if pinned {
+        "Right-click to reorder or remove"
+    } else {
+        "Auto-detected from recent activity · right-click to pin"
+    };
     let label = Label::builder()
         .label(basename(path))
         .xalign(0.0)
         .hexpand(true)
         .ellipsize(gtk4::pango::EllipsizeMode::Middle)
-        // Full path (names are middle-ellipsized) + a hint that reorder/remove
-        // live on the right-click menu, since this row no longer has an inline
-        // remove button.
-        .tooltip_text(format!("{path}\nRight-click to reorder or remove"))
+        // Full path (names are middle-ellipsized) + where to manage the row.
+        .tooltip_text(format!("{path}\n{hint}"))
         .build();
     label.add_css_class("proj-name");
     hbox.append(&label);
@@ -555,7 +681,11 @@ fn make_project_row(state: &State, path: &str) -> ListBoxRow {
 
     row.set_child(Some(&hbox));
 
-    attach_reorder_menu(state, &row, path);
+    if pinned {
+        attach_reorder_menu(state, &row, path);
+    } else {
+        attach_pin_menu(state, &row, path);
+    }
     row
 }
 
@@ -639,6 +769,78 @@ fn move_project(state: &State, path: &str, delta: i32) {
             if j >= 0 && (j as usize) < s.config.projects.len() {
                 s.config.projects.swap(i, j as usize);
             }
+        }
+    }
+    rebuild_sidebar(state);
+    save_state(state);
+}
+
+/// Right-click an auto-discovered "RECENT" row → Launch settings / Pin to rail.
+/// Pinning promotes it into the curated list so it stays put and gains the full
+/// reorder/remove menu.
+fn attach_pin_menu(state: &State, row: &ListBoxRow, path: &str) {
+    let menu = gio::Menu::new();
+    menu.append(Some("Launch settings…"), Some("project.preset"));
+    let manage = gio::Menu::new();
+    manage.append(Some("Pin to rail"), Some("project.pin"));
+    menu.append_section(None, &manage);
+
+    let actions = gio::SimpleActionGroup::new();
+    let preset = gio::SimpleAction::new("preset", None);
+    {
+        let st = state.clone();
+        let path = path.to_string();
+        let row_weak = row.downgrade();
+        preset.connect_activate(move |_, _| {
+            let win = row_weak
+                .upgrade()
+                .and_then(|r| r.root())
+                .and_downcast::<gtk4::Window>();
+            open_project_preset(&st, &path, win.as_ref());
+        });
+    }
+    let pin = gio::SimpleAction::new("pin", None);
+    {
+        let st = state.clone();
+        let path = path.to_string();
+        pin.connect_activate(move |_, _| pin_project(&st, &path));
+    }
+    actions.add_action(&preset);
+    actions.add_action(&pin);
+    row.insert_action_group("project", Some(&actions));
+
+    let popover = PopoverMenu::from_model(Some(&menu));
+    popover.set_parent(row);
+    popover.set_has_arrow(false);
+    popover.set_halign(gtk4::Align::Start);
+
+    let gesture = GestureClick::new();
+    gesture.set_button(gdk::BUTTON_SECONDARY);
+    gesture.connect_pressed(glib::clone!(
+        #[weak]
+        popover,
+        move |_, _, x, y| {
+            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.popup();
+        }
+    ));
+    row.add_controller(gesture);
+
+    row.connect_destroy(glib::clone!(
+        #[weak]
+        popover,
+        move |_| popover.unparent()
+    ));
+}
+
+/// Promote an auto-discovered project into the curated rail list (idempotent),
+/// then rebuild so it moves from "RECENT" up into "PINNED".
+fn pin_project(state: &State, path: &str) {
+    {
+        let mut s = state.borrow_mut();
+        let path = config::normalize_project_path(path);
+        if !s.config.projects.contains(&path) {
+            s.config.projects.push(path);
         }
     }
     rebuild_sidebar(state);
@@ -1084,17 +1286,24 @@ fn refresh_statuses(state: &State, app: &Application) {
 
     let mut finished: Vec<(String, String)> = Vec::new();
     let mut refresh_dash = false;
+    let mut refresh_project: Option<String> = None;
     {
         let mut s = state.borrow_mut();
         update_queue_badge(&s.queue_badge, &s.queue_btn, waiting, working, blocked);
         // Keep the home overview live: when the waiting/working counts change
         // while it's the visible page, rebuild it (cheap — only on transitions,
         // not every tick) so it doesn't disagree with the header badge.
-        let on_home = s.stack.visible_child_name().map(|n| n == "home").unwrap_or(false);
-        if on_home && ((waiting, working) != s.last_dash_counts || hook_fp != s.last_dash_hook_fp) {
+        let visible = s.stack.visible_child_name();
+        let on_home = visible.as_ref().map(|n| n == "home").unwrap_or(false);
+        let on_project = visible.as_ref().map(|n| n == "project").unwrap_or(false);
+        let transitioned = (waiting, working) != s.last_dash_counts || hook_fp != s.last_dash_hook_fp;
+        if (on_home || on_project) && transitioned {
             s.last_dash_counts = (waiting, working);
             s.last_dash_hook_fp = hook_fp;
-            refresh_dash = true;
+            refresh_dash = on_home;
+            // Mirror the home auto-refresh for the project page: on a transition,
+            // re-list its sessions so status/cost/title changes there show too.
+            refresh_project = if on_project { s.project_view.clone() } else { None };
         }
         let current = s.notebook.current_page();
         // Snapshot page numbers via cloned terminals so the mutable tabs loop
@@ -1128,6 +1337,9 @@ fn refresh_statuses(state: &State, app: &Application) {
     }
     if refresh_dash {
         refresh_dashboard(state);
+    }
+    if let Some(project) = refresh_project {
+        refresh_project_view(state, &project);
     }
 }
 
@@ -1386,7 +1598,104 @@ fn toggle_home(state: &State) {
 /// Rebuild the dashboard from current data and show it.
 fn show_home(state: &State) {
     refresh_dashboard(state);
+    // Leaving the project view — stop the poll from refreshing it underneath us.
+    state.borrow_mut().project_view = None;
     state.borrow().stack.set_visible_child_name("home");
+}
+
+/// Open a project's own page in the main pane: its full session history, each
+/// row resumable, plus a one-click "New session". This is what clicking a rail
+/// project does — the direct answer to "which sessions did I have in this
+/// project?" after a crash, since it lists every session on disk, not just the
+/// few that were open in tabs.
+fn show_project(state: &State, project: &str) {
+    state.borrow_mut().project_view = Some(project.to_string());
+    refresh_project_view(state, project);
+    state.borrow().stack.set_visible_child_name("project");
+}
+
+/// Clear and rebuild the per-project page from the project's transcripts.
+fn refresh_project_view(state: &State, project: &str) {
+    let pbox = state.borrow().proj_box.clone();
+    while let Some(child) = pbox.first_child() {
+        pbox.remove(&child);
+    }
+
+    // ── header: swatch + project name + a "New session" CTA ──
+    let head = gtk4::Box::new(Orientation::Horizontal, 12);
+    let titlebox = gtk4::Box::new(Orientation::Horizontal, 11);
+    titlebox.set_hexpand(true);
+    titlebox.set_valign(gtk4::Align::Center);
+    titlebox.append(&make_swatch(project, 13));
+    let name = Label::builder().label(basename(project)).xalign(0.0).build();
+    name.add_css_class("dash-greeting");
+    name.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+    titlebox.append(&name);
+    head.append(&titlebox);
+
+    let new_btn = Button::with_label("+ New session");
+    new_btn.add_css_class("proj-new");
+    new_btn.set_valign(gtk4::Align::Center);
+    new_btn.set_tooltip_text(Some(&format!("Start a new Claude session in {}", basename(project))));
+    {
+        let st = state.clone();
+        let project = project.to_string();
+        new_btn.connect_clicked(move |_| launch_new_session(&st, &project));
+    }
+    head.append(&new_btn);
+    pbox.append(&head);
+
+    // Full path, so the same basename in two trees stays distinguishable.
+    let sub = Label::builder().label(project).xalign(0.0).build();
+    sub.add_css_class("dim-label");
+    sub.add_css_class("caption");
+    sub.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+    pbox.append(&sub);
+
+    let session_list = sessions::list_sessions(project);
+    if session_list.is_empty() {
+        pbox.append(&dash_section_label("SESSIONS"));
+        let empty = Label::builder()
+            .label("No past sessions in this project yet — start one above.")
+            .xalign(0.0)
+            .build();
+        empty.add_css_class("dim-label");
+        pbox.append(&empty);
+        return;
+    }
+
+    // The list is capped at MAX_SESSIONS, so flag when we're only showing the
+    // most-recent slice of a long-lived project's history.
+    let n = session_list.len();
+    let heading = if n >= sessions::MAX_SESSIONS {
+        format!("SESSIONS · {n} most recent")
+    } else {
+        format!("SESSIONS · {n}")
+    };
+    pbox.append(&dash_section_label(&heading));
+
+    let list = ListBox::new();
+    list.add_css_class("dash-list");
+    list.set_selection_mode(SelectionMode::None);
+    // Every session in a project shares its branch — one `.git/HEAD` read, not one
+    // per row.
+    let branch = git::current_branch(project);
+    for meta in &session_list {
+        list.append(&make_dash_recent_row(project, meta, branch.as_deref()));
+    }
+    // index → (id, title), parallel to the rows appended above.
+    let items: Vec<(String, String)> = session_list
+        .iter()
+        .map(|m| (m.id.clone(), m.title.clone()))
+        .collect();
+    let st = state.clone();
+    let proj = project.to_string();
+    list.connect_row_activated(move |_, row| {
+        if let Some((id, title)) = items.get(row.index() as usize) {
+            resume_session(&st, &proj, id, title);
+        }
+    });
+    pbox.append(&list);
 }
 
 /// Clear and rebuild the dashboard: a greeting, the cross-project needs-you
@@ -3190,6 +3499,13 @@ headerbar.rune-header button.flat:checked { color: #36d3fa; background-color: #1
 }
 .proj-name { font-family: monospace; font-size: 0.92em; color: #9fb0c0; }
 .proj-row:selected .proj-name { color: #e8eef5; }
+/* auto-discovered "RECENT" rows read one step quieter than pinned ones */
+.proj-row-auto .proj-name { color: #75889a; }
+.proj-row-auto:selected .proj-name { color: #e8eef5; }
+
+/* "PINNED" / "RECENT" dividers inside the rail */
+.rail-subhead { font-family: monospace; font-size: 0.64em; font-weight: 700;
+  letter-spacing: 1.4px; color: #4a5a68; padding: 8px 0 2px 12px; }
 
 .rail-badge { font-family: monospace; font-size: 0.7em; font-weight: 700; min-width: 18px; padding: 1px 5px; border-radius: 3px; }
 .badge-idle { color: #44545f; background-color: #131b25; border: 1px solid #1b2531; }
@@ -3213,6 +3529,10 @@ paned > separator { background-color: #1b2531; }
     linear-gradient(90deg, rgba(110,200,225,0.05) 1px, transparent 1px);
   background-size: 34px 34px; padding: 22px; }
 .dash-greeting { font-size: 1.7em; font-weight: 800; }
+/* the per-project page's "New session" CTA — cyan, matching the brand accent */
+.proj-new { font-weight: 700; color: #0b0f15; background-color: #36d3fa;
+  border: none; border-radius: 6px; padding: 6px 14px; }
+.proj-new:hover { background-color: #5fdcff; }
 .dash-section { font-size: 0.76em; font-weight: 700; color: #5fd0e0; margin-top: 6px; }
 .tnum { font-family: monospace; }
 .dash-card { background-color: rgba(18,26,34,0.66);

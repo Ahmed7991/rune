@@ -19,11 +19,15 @@ pub fn encode_cwd(path: &str) -> String {
         .collect()
 }
 
+/// `~/.claude/projects/` — the root holding one encoded-cwd dir per project
+/// Claude has ever run in. Used to auto-discover projects for the rail.
+pub fn projects_root() -> PathBuf {
+    glib::home_dir().join(".claude/projects")
+}
+
 /// `~/.claude/projects/<encoded-cwd>/` — where a project's transcripts live.
 pub fn project_transcript_dir(project_path: &str) -> PathBuf {
-    glib::home_dir()
-        .join(".claude/projects")
-        .join(encode_cwd(project_path))
+    projects_root().join(encode_cwd(project_path))
 }
 
 /// True if Claude already has a transcript for this session under this project.

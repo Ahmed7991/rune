@@ -23,7 +23,7 @@ rune is a desktop control room for [Claude Code](https://docs.anthropic.com/en/d
 ## Features
 
 - **Mission-Control dashboard** — opens to a cross-project overview: a greeting glance ("*N agents want you*"), the **needs-you command board** (one row per live session with a status pill — your-turn / working / finished — and an action), **project cards** (click → new session, each with its estimated total cost), and **recent sessions** (click → resume) showing a model chip, git branch, and a context-fill bar.
-- **Project rail** — a sidebar with a per-project identity colour, a live status badge, and an accent stripe on the active project. Add / remove / reorder from the right-click menu.
+- **Project rail** — a sidebar with a per-project identity colour, a live status badge, and an accent stripe on the active project. **Pinned** projects sit above an auto-discovered **Recent** section (any project with on-disk Claude history from the last 14 days), and **clicking a project opens its full session list** in the main pane. Add / remove / reorder / pin from the right-click menu.
 - **Tabbed `claude` terminals** — one session per tab, spawned in the correct project directory, with correct input and copy-paste (`Ctrl+Shift+C/V` or right-click).
 - **Browse & resume** — list a project's past sessions (real titles, last-active, prompt count) and resume any of them in a click.
 - **Live status + notifications** — a per-tab dot (working / idle / not-running) read live from `~/.claude`, plus a desktop notification when a background session finishes.

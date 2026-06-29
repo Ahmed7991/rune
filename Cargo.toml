@@ -1,6 +1,6 @@
 [package]
 name = "rune"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "A native (GTK4 + VTE, no webview) Linux control cockpit for Claude Code sessions."
 license = "MIT"
